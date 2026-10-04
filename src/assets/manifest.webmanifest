@@ -1,0 +1,9 @@
+{
+  "name": "SignCourse Studio",
+  "short_name": "SignCourse",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#edf3f1",
+  "theme_color": "#173c35",
+  "icons": []
+}

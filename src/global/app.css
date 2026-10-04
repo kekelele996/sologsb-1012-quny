@@ -1,0 +1,29 @@
+
+:root {
+  --ion-font-family: "Avenir Next", "PingFang SC", "Helvetica Neue", sans-serif;
+  --ion-color-primary: #126b61;
+  --ion-color-primary-rgb: 18, 107, 97;
+  --ion-color-primary-contrast: #ffffff;
+  --ion-color-primary-shade: #105e55;
+  --ion-color-primary-tint: #2a7a71;
+  --studio-ink: #18312d;
+  --studio-muted: #667b76;
+  --studio-line: #d6e1de;
+  --studio-paper: #fbfdfc;
+  --studio-canvas: #edf3f1;
+  --studio-warning: #a36100;
+  --studio-danger: #b42318;
+  background: var(--studio-canvas);
+  color: var(--studio-ink);
+}
+
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; }
+body { overflow: hidden; background: var(--studio-canvas); }
+app-root { display: block; width: 100%; height: 100%; }
+ion-app, .ion-page { width: 100%; height: 100%; }
+ion-app { position: relative; display: flex; flex-direction: column; background: var(--studio-canvas); }
+.ion-page { left: 0; right: 0; top: 0; bottom: 0; display: flex; position: absolute; flex-direction: column; justify-content: space-between; contain: layout size style; z-index: 0; }
+.studio-button { --border-radius: 8px; --box-shadow: none; text-transform: none; }
+.studio-input { --background: #ffffff; --padding-start: 10px; --padding-end: 10px; --border-radius: 7px; border: 1px solid var(--studio-line); }
+.studio-input.ion-invalid { border-color: #f04438; }
