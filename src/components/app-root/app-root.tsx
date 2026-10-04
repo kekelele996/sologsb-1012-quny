@@ -1,7 +1,14 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
+  CURRENT_SCHEMA_VERSION,
+  EQUIPMENT_CATALOG,
+  backfillModules,
   cloneProject,
+  createDemoLedger,
   createDemoProject,
+  moduleEffectiveEquipment,
+  moduleEquipmentFromCameras,
+  moduleHours,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
@@ -11,12 +18,17 @@ import {
   type CourseModule,
   type CourseProject,
   type Difficulty,
+  type Equipment,
   type GestureZone,
   type LessonStep,
+  type ScheduleAssignment,
+  type ScheduleStatus,
   type ValidationCheck,
 } from '../../models';
+import { reconcileSchedule, runSchedule } from '../../lib/scheduling';
 
 type PreviewSize = 'phone' | 'tablet';
+type ActivePanel = 'editor' | 'checks' | 'schedule';
 
 @Component({
   tag: 'app-root',
@@ -26,22 +38,37 @@ type PreviewSize = 'phone' | 'tablet';
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
-  @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() activePanel: ActivePanel = 'editor';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
+  @State() importingLedger = false;
   @State() toast?: { color: string; message: string };
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
+  /** 演示用：触发下一次导入失败，以演示“按教务侧重试”流程。 */
+  private failNextImport = false;
 
   componentWillLoad(): void {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) this.project = JSON.parse(saved) as CourseProject;
+      if (saved) this.project = this.upgradeProject(JSON.parse(saved) as CourseProject);
     } catch {
       this.project = createDemoProject();
     }
+  }
+
+  /** 旧数据升级：补齐设备需求与排课字段，设备缺失时按镜头角度回填。 */
+  private upgradeProject(project: CourseProject): CourseProject {
+    const modules = backfillModules(Array.isArray(project.modules) ? project.modules : []);
+    return {
+      ...project,
+      modules,
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      ledgerStatus: project.ledger ? 'ready' : (project.ledgerStatus ?? 'idle'),
+      schedule: Array.isArray(project.schedule) ? project.schedule : [],
+    };
   }
 
   disconnectedCallback(): void {
@@ -154,13 +181,21 @@ export class AppRoot {
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
+    const cameraChanged = patch.camera !== undefined;
     this.commit((draft) => ({
       ...draft,
-      modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
-        ...module,
-        steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step),
-      } : module),
+      modules: draft.modules.map((module) => {
+        if (module.id !== draft.selectedModuleId) return module;
+        const steps = module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step);
+        // 设备需求默认随镜头角度回填；教师手工维护过则保留手工值。
+        const equipment = cameraChanged && !module.equipmentManual
+          ? moduleEquipmentFromCameras({ ...module, steps })
+          : module.equipment;
+        return { ...module, steps, equipment };
+      }),
     }), toast);
+    // 时长或镜头角度（设备需求）变更后，已排模块作废重排。
+    if (patch.duration !== undefined || cameraChanged) this.refreshScheduleAfterChange();
   }
 
   private updateCurrentModule(patch: Partial<CourseModule>): void {
@@ -178,6 +213,8 @@ export class AppRoot {
       summary: '说明该模块的学习目标与适用场景。',
       color: ['#15827a', '#8a3ffc', '#b34331', '#376ea8'][index % 4],
       steps: [],
+      equipment: [],
+      equipmentManual: false,
     };
     this.commit((draft) => ({ ...draft, modules: [...draft.modules, module], selectedModuleId: module.id, selectedStepId: '' }), '已创建课程模块。');
   }
@@ -306,6 +343,250 @@ export class AppRoot {
 
   private reviseFrozen(): void {
     this.commit((draft) => ({ ...draft, status: 'draft' }), '已创建修订版，可继续编辑。');
+  }
+
+  // —— 排课：教务台账导入 / 自动排课 / 作废与挂起 ——
+
+  private assignmentFor(moduleId: string): ScheduleAssignment | undefined {
+    return this.project.schedule.find((item) => item.moduleId === moduleId);
+  }
+
+  private sameEquipment(a: Equipment[], b: Equipment[]): boolean {
+    return a.length === b.length && a.every((item, index) => item === b[index]);
+  }
+
+  /** 导入教务台账（模拟异步）。失败时提示，可按教务侧重试。 */
+  private importLedger(): void {
+    if (this.importingLedger) return;
+    this.importingLedger = true;
+    this.project = { ...this.project, ledgerStatus: 'importing', ledgerError: undefined };
+    this.persist();
+    window.setTimeout(() => {
+      if (this.failNextImport) {
+        this.failNextImport = false;
+        this.importingLedger = false;
+        this.project = { ...this.project, ledgerStatus: 'failed', ledgerError: '教务台账服务暂不可用，请稍后按教务侧重试。' };
+        this.persist();
+        this.showToast('danger', '导入档期失败，可按教务侧重试。');
+        return;
+      }
+      const ledger = createDemoLedger();
+      const reconciled = reconcileSchedule(this.project.schedule, this.project.modules, ledger);
+      const result = runSchedule(this.project.modules, ledger, reconciled.assignments, new Date().toISOString());
+      this.importingLedger = false;
+      this.project = { ...this.project, ledger, ledgerStatus: 'ready', ledgerError: undefined, schedule: result.assignments };
+      this.persist();
+      this.showToast('success', `台账已导入并逐条对账：已排 ${result.scheduled}，排队 ${result.queued}，排不下 ${result.unschedulable}，挂起 ${reconciled.suspended}。`);
+    }, 650);
+  }
+
+  /** 导入失败后按教务侧重试。 */
+  private retryImport(): void {
+    this.importLedger();
+  }
+
+  /** 按当前台账把待排/作废/排不下的模块重新排进档期。 */
+  private runAutoSchedule(showMessage = true): void {
+    const ledger = this.project.ledger;
+    if (!ledger) {
+      this.showToast('warning', '请先导入教务台账，再自动排课。');
+      return;
+    }
+    const result = runSchedule(this.project.modules, ledger, this.project.schedule, new Date().toISOString());
+    this.project = { ...this.project, schedule: result.assignments };
+    this.persist();
+    if (showMessage) {
+      this.showToast('success', `排课完成：已排 ${result.scheduled}，排队 ${result.queued}，排不下 ${result.unschedulable}，作废重排 ${result.invalidated}。`);
+    }
+  }
+
+  /** 挂起的模块核对无误后，重新排队进入排课。 */
+  private requeueSuspended(moduleId: string): void {
+    const schedule = this.project.schedule.map((item) =>
+      item.moduleId === moduleId && item.status === 'suspended'
+        ? { ...item, status: 'pending' as ScheduleStatus, reason: undefined }
+        : item);
+    this.project = { ...this.project, schedule };
+    this.persist();
+    this.runAutoSchedule(false);
+  }
+
+  /** 步骤时长或设备需求变更后，已排模块作废并重排；未导入台账时先标记作废。 */
+  private refreshScheduleAfterChange(): void {
+    const { ledger, modules, schedule } = this.project;
+    if (!ledger) {
+      const next = schedule.map((item) => {
+        if (item.status !== 'scheduled') return item;
+        const module = modules.find((candidate) => candidate.id === item.moduleId);
+        if (!module) return item;
+        const hours = moduleHours(module);
+        const equipment = moduleEffectiveEquipment(module);
+        if (item.hours !== hours || !this.sameEquipment(item.equipment, equipment)) {
+          return { ...item, status: 'invalid' as ScheduleStatus, reason: '步骤时长或设备需求已变更' };
+        }
+        return item;
+      });
+      this.project = { ...this.project, schedule: next };
+      this.persist();
+      return;
+    }
+    const result = runSchedule(modules, ledger, schedule, new Date().toISOString());
+    this.project = { ...this.project, schedule: result.assignments };
+    this.persist();
+  }
+
+  /** 教师手工维护设备需求；变更后已排模块作废重排。 */
+  private toggleEquipment(moduleId: string, equipment: Equipment): void {
+    const modules = this.project.modules.map((module) => {
+      if (module.id !== moduleId) return module;
+      const current = moduleEffectiveEquipment(module);
+      const next = current.includes(equipment) ? current.filter((item) => item !== equipment) : [...current, equipment];
+      return { ...module, equipment: next, equipmentManual: true };
+    });
+    this.project = { ...this.project, modules };
+    this.persist();
+    this.refreshScheduleAfterChange();
+  }
+
+  /** 按模块内各步骤的镜头角度重新回填设备需求。 */
+  private backfillEquipmentForModule(moduleId: string): void {
+    const modules = this.project.modules.map((module) =>
+      module.id === moduleId ? { ...module, equipment: moduleEquipmentFromCameras(module), equipmentManual: false } : module);
+    this.project = { ...this.project, modules };
+    this.persist();
+    this.refreshScheduleAfterChange();
+  }
+
+  private slotLabel(slotId?: string): string {
+    if (!slotId || !this.project.ledger) return '—';
+    const slot = this.project.ledger.slots.find((item) => item.id === slotId);
+    if (!slot) return '—';
+    const classroom = this.project.ledger.classrooms.find((item) => item.id === slot.classroomId);
+    return `${classroom?.name ?? '未知教室'} · ${slot.weekday} ${slot.period}`;
+  }
+
+  private scheduleStatusMeta(status?: ScheduleStatus): { label: string; color: string } {
+    switch (status) {
+      case 'scheduled': return { label: '已排课', color: 'success' };
+      case 'pending': return { label: '排队中', color: 'warning' };
+      case 'unschedulable': return { label: '排不下', color: 'danger' };
+      case 'invalid': return { label: '已作废', color: 'danger' };
+      case 'suspended': return { label: '已挂起', color: 'medium' };
+      default: return { label: '未排课', color: 'medium' };
+    }
+  }
+
+  private renderModuleScheduleBadge(moduleId: string) {
+    const meta = this.scheduleStatusMeta(this.assignmentFor(moduleId)?.status);
+    return <span class={`module-schedule-badge ${meta.color}`}>{meta.label}</span>;
+  }
+
+  private renderAssignmentRow(assignment: ScheduleAssignment) {
+    const module = this.project.modules.find((item) => item.id === assignment.moduleId);
+    if (!module) return null;
+    const meta = this.scheduleStatusMeta(assignment.status);
+    return (
+      <div class={`schedule-row status-${assignment.status}`} key={assignment.moduleId}>
+        <span class={`schedule-dot ${meta.color}`} />
+        <div class="schedule-row-main">
+          <strong>{module.title}</strong>
+          <small>
+            {assignment.hours} 课时 · 设备 {assignment.equipment.length ? assignment.equipment.join('、') : '无特殊设备需求'}
+            {assignment.status === 'scheduled' ? ` · ${this.slotLabel(assignment.slotId)}` : ''}
+          </small>
+          {assignment.reason && <small class="schedule-reason">{assignment.reason}</small>}
+        </div>
+        {assignment.status === 'suspended' && (
+          <ion-button size="small" fill="outline" class="studio-button" onClick={() => this.requeueSuspended(assignment.moduleId)}>重新排队</ion-button>
+        )}
+      </div>
+    );
+  }
+
+  private renderLedgerBanner() {
+    const status = this.project.ledgerStatus;
+    if (status === 'importing') {
+      return <div class="ledger-banner importing"><span class="ledger-spinner" /> 正在导入教务台账…</div>;
+    }
+    if (status === 'failed') {
+      return (
+        <div class="ledger-banner failed">
+          <div><strong>导入档期失败</strong><span>{this.project.ledgerError ?? '教务侧暂时不可用。'}</span></div>
+          <ion-button size="small" class="studio-button" onClick={() => this.retryImport()}>按教务侧重试</ion-button>
+        </div>
+      );
+    }
+    if (status === 'ready' && this.project.ledger) {
+      const ledger = this.project.ledger;
+      return (
+        <div class="ledger-banner ready">
+          <div>
+            <strong>台账已就绪</strong>
+            <span>{ledger.source} · {this.formatDate(ledger.importedAt)} · {ledger.classrooms.length} 间教室 · {ledger.slots.length} 个档期</span>
+          </div>
+          <button class="simulate-fail" onClick={() => { this.failNextImport = true; this.importLedger(); }}>模拟导入失败</button>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  private renderSchedule() {
+    const ledger = this.project.ledger;
+    const assignments = this.project.schedule;
+    const groups: { key: ScheduleStatus | 'unscheduled'; title: string; items: ScheduleAssignment[] }[] = [
+      { key: 'suspended', title: '挂起（与教室/档期对不上，先挂起）', items: assignments.filter((item) => item.status === 'suspended') },
+      { key: 'invalid', title: '已作废（步骤时长或设备已变更）', items: assignments.filter((item) => item.status === 'invalid') },
+      { key: 'unschedulable', title: '排不下（没有档期放得下）', items: assignments.filter((item) => item.status === 'unschedulable') },
+      { key: 'pending', title: '排队中（档期排满，等下一个）', items: assignments.filter((item) => item.status === 'pending') },
+      { key: 'scheduled', title: '已排课', items: assignments.filter((item) => item.status === 'scheduled') },
+    ];
+    return (
+      <section class="schedule-panel">
+        <div class="schedule-head">
+          <div>
+            <span class="eyebrow">教学档期</span>
+            <h2>模块排课</h2>
+            <p>按模块总时长与设备需求排进档期；同一教室同一档期只排一个模块，档期以教务台账为准、工具不回改。</p>
+          </div>
+          <div class="schedule-actions">
+            {ledger && <ion-button fill="outline" class="studio-button" onClick={() => this.importLedger()}>重新导入并对账</ion-button>}
+            {ledger && <ion-button class="studio-button" onClick={() => this.runAutoSchedule()}>自动排课</ion-button>}
+          </div>
+        </div>
+
+        {this.renderLedgerBanner()}
+
+        {!ledger && this.project.ledgerStatus !== 'importing' && this.project.ledgerStatus !== 'failed' && (
+          <div class="schedule-empty">
+            <div class="empty-glyph">档</div>
+            <h2>尚未导入教务台账</h2>
+            <p>台账记录教室、档期与各档期可排课时。导入后即可把课程模块按设备需求与课时容量排进档期，排满自动排队，排不下单独列出。</p>
+            <ion-button class="studio-button" onClick={() => this.importLedger()}>导入教务台账</ion-button>
+          </div>
+        )}
+
+        {ledger && assignments.length === 0 && (
+          <div class="schedule-empty">
+            <div class="empty-glyph">排</div>
+            <h2>还没有排课结果</h2>
+            <p>导入台账后会自动排课；也可以点击「自动排课」按当前模块与设备需求重新排。</p>
+            <ion-button class="studio-button" onClick={() => this.runAutoSchedule()}>自动排课</ion-button>
+          </div>
+        )}
+
+        {ledger && assignments.length > 0 && (
+          <div class="schedule-groups">
+            {groups.filter((group) => group.items.length > 0).map((group) => (
+              <section class="schedule-group" key={group.key}>
+                <div class="schedule-group-head"><h3>{group.title}</h3><span>{group.items.length}</span></div>
+                {group.items.map((item) => this.renderAssignmentRow(item))}
+              </section>
+            ))}
+          </div>
+        )}
+      </section>
+    );
   }
 
   private togglePlay(): void {
@@ -593,7 +874,8 @@ export class AppRoot {
                     <section class={`module-card ${item.id === module?.id ? 'active' : ''}`} key={item.id}>
                       <button class="module-head" onClick={() => this.selectModule(item.id)}>
                         <span class="module-color" style={{ background: item.color }} />
-                        <span><strong>{item.title}</strong><small>{item.steps.length} 个学习步骤</small></span>
+                        <span><strong>{item.title}</strong><small>{item.steps.length} 个学习步骤 · {moduleHours(item)} 课时</small></span>
+                        {this.renderModuleScheduleBadge(item.id)}
                       </button>
                       {item.id === module?.id && <div class="step-list">{item.steps.map((lesson, index) => this.renderStepListItem(lesson, index))}</div>}
                     </section>
@@ -602,6 +884,28 @@ export class AppRoot {
                 <div class="module-editor">
                   <ion-input disabled={this.project.status === 'frozen'} label="当前模块标题" labelPlacement="stacked" class="studio-input" value={module?.title ?? ''} onIonInput={(event) => this.updateCurrentModule({ title: event.detail.value ?? '' })} />
                   <ion-textarea disabled={this.project.status === 'frozen'} autoGrow label="模块目标" labelPlacement="stacked" class="studio-input" value={module?.summary ?? ''} onIonInput={(event) => this.updateCurrentModule({ summary: event.detail.value ?? '' })} />
+                  {module && (
+                    <div class="equipment-editor">
+                      <div class="equipment-head">
+                        <span>设备需求</span>
+                        <button class="equipment-backfill" disabled={this.project.status === 'frozen'} onClick={() => this.backfillEquipmentForModule(module.id)}>按镜头角度回填</button>
+                      </div>
+                      <div class="equipment-chips">
+                        {EQUIPMENT_CATALOG.map((equipment) => {
+                          const active = moduleEffectiveEquipment(module).includes(equipment);
+                          return (
+                            <button
+                              class={`equipment-chip ${active ? 'active' : ''}`}
+                              disabled={this.project.status === 'frozen'}
+                              onClick={() => this.toggleEquipment(module.id, equipment)}>
+                              {equipment}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <small class="equipment-hint">设备需求默认随镜头角度汇总，也可手工勾选；时长或设备变更后已排模块作废重排。</small>
+                    </div>
+                  )}
                 </div>
               </aside>
 
@@ -609,8 +913,9 @@ export class AppRoot {
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
                   <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                  <button class={this.activePanel === 'schedule' ? 'active' : ''} onClick={() => { this.activePanel = 'schedule'; }}>排课 <span>{this.project.schedule.filter((item) => item.status === 'scheduled').length}</span></button>
                 </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.activePanel === 'checks' ? this.renderChecks() : this.renderSchedule()}</div>
               </section>
 
               {this.renderPreview()}

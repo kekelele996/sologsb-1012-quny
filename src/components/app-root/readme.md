@@ -9,8 +9,8 @@
 
 ### Depends on
 
-- ion-badge
 - ion-button
+- ion-badge
 - ion-input
 - ion-select
 - ion-select-option
@@ -27,8 +27,8 @@
 ### Graph
 ```mermaid
 graph TD;
-  app-root --> ion-badge
   app-root --> ion-button
+  app-root --> ion-badge
   app-root --> ion-input
   app-root --> ion-select
   app-root --> ion-select-option

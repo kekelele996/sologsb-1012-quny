@@ -4,6 +4,23 @@ export type CameraAngle = '正面' | '左侧 45°' | '右侧 45°' | '俯拍手�
 export type CaptionPosition = '下方安全区' | '上移 15%' | '角标提示' | '画面中央';
 export type GestureZone = '左侧' | '中央' | '右侧';
 
+/** 设备需求：由镜头角度回填，也可由教师手工维护。 */
+export type Equipment = '固定机位' | '侧位机位' | '俯拍支架' | '广角机位';
+
+export const EQUIPMENT_CATALOG: Equipment[] = ['固定机位', '侧位机位', '俯拍支架', '广角机位'];
+
+/** 镜头角度 → 所需设备。旧数据升级时按这个映射回填设备需求。 */
+export const CAMERA_EQUIPMENT: Record<CameraAngle, Equipment[]> = {
+  正面: ['固定机位'],
+  '左侧 45°': ['侧位机位'],
+  '右侧 45°': ['侧位机位'],
+  俯拍手部: ['俯拍支架'],
+  全身远景: ['广角机位'],
+};
+
+/** 一个标准课时的分钟数，模块总时长按它换算成课时。 */
+export const CLASS_HOUR_MINUTES = 45;
+
 export interface LessonStep {
   id: string;
   title: string;
@@ -31,6 +48,49 @@ export interface CourseModule {
   summary: string;
   color: string;
   steps: LessonStep[];
+  /** 设备需求；旧数据没有该字段，升级时按镜头角度回填。 */
+  equipment: Equipment[];
+  /** 设备是否由教师手工维护；未手工维护时随镜头角度自动回填。 */
+  equipmentManual?: boolean;
+}
+
+/** 教室：台账里的教室自带可提供的设备。 */
+export interface Classroom {
+  id: string;
+  name: string;
+  equipment: Equipment[];
+}
+
+/** 档期：归属某间教室，记录星期/节次与可排课时容量。 */
+export interface LedgerSlot {
+  id: string;
+  classroomId: string;
+  weekday: string;
+  period: string;
+  capacityHours: number;
+}
+
+/** 教务台账：以教务侧为准，课程工具只导入、不回改。 */
+export interface TeachingLedger {
+  importedAt: string;
+  source: string;
+  classrooms: Classroom[];
+  slots: LedgerSlot[];
+}
+
+export type ScheduleStatus = 'scheduled' | 'pending' | 'unschedulable' | 'invalid' | 'suspended';
+
+/** 某个模块的排课结果。同一个教室同一个档期只放一个模块。 */
+export interface ScheduleAssignment {
+  moduleId: string;
+  status: ScheduleStatus;
+  classroomId?: string;
+  slotId?: string;
+  /** 排课时的课时与设备快照；时长或设备变更后据此判定作废。 */
+  hours: number;
+  equipment: Equipment[];
+  scheduledAt?: string;
+  reason?: string;
 }
 
 export interface FrozenVersion {
@@ -52,6 +112,14 @@ export interface CourseProject {
   frozenVersions: FrozenVersion[];
   lastSavedAt: string;
   revision: number;
+  /** 数据结构版本，用于旧数据升级（如回填设备需求）。 */
+  schemaVersion: number;
+  /** 最近一次导入的教务台账；台账以教务侧为准，工具不回改。 */
+  ledger?: TeachingLedger;
+  ledgerStatus: 'idle' | 'importing' | 'failed' | 'ready';
+  ledgerError?: string;
+  /** 各模块的排课结果，按 moduleId 对应。 */
+  schedule: ScheduleAssignment[];
 }
 
 export interface ValidationCheck {
@@ -72,6 +140,7 @@ export function createDemoProject(): CourseProject {
       title: '模块一 · 日常问候',
       summary: '建立手形、视线和面部表情之间的配合，完成三个基础问候。',
       color: '#15827a',
+      equipment: ['固定机位', '俯拍支架', '广角机位'],
       steps: [
         {
           id: 'step-1-1',
@@ -140,6 +209,7 @@ export function createDemoProject(): CourseProject {
       title: '模块二 · 数量表达',
       summary: '用数字、空间位置和顺序词完成价格询问。',
       color: '#8a3ffc',
+      equipment: ['固定机位', '侧位机位'],
       steps: [
         {
           id: 'step-2-1',
@@ -197,7 +267,67 @@ export function createDemoProject(): CourseProject {
     frozenVersions: [],
     lastSavedAt: new Date().toISOString(),
     revision: 1,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    ledgerStatus: 'idle',
+    schedule: [],
   };
+}
+
+/** 当前数据结构版本；旧数据在升级时按这个版本号补齐字段。 */
+export const CURRENT_SCHEMA_VERSION = 2;
+
+/** 模块总时长（秒）。 */
+export function moduleTotalSeconds(module: CourseModule): number {
+  return module.steps.reduce((sum, step) => sum + step.duration, 0);
+}
+
+/** 模块总课时：按标准课时换算，不足 1 课时按 1 课时计。 */
+export function moduleHours(module: CourseModule): number {
+  return Math.max(1, Math.ceil(moduleTotalSeconds(module) / (CLASS_HOUR_MINUTES * 60)));
+}
+
+/** 按模块内各步骤的镜头角度汇总出设备需求（去重并按设备目录排序）。 */
+export function moduleEquipmentFromCameras(module: CourseModule): Equipment[] {
+  const picked = new Set<Equipment>();
+  module.steps.forEach((step) => {
+    (CAMERA_EQUIPMENT[step.camera] ?? []).forEach((equipment) => picked.add(equipment));
+  });
+  return EQUIPMENT_CATALOG.filter((equipment) => picked.has(equipment));
+}
+
+/** 模块当前生效的设备需求：优先用手工维护值，否则按镜头角度回填。 */
+export function moduleEffectiveEquipment(module: CourseModule): Equipment[] {
+  if (Array.isArray(module.equipment) && module.equipment.length) return module.equipment;
+  return moduleEquipmentFromCameras(module);
+}
+
+/**
+ * 旧数据升级：没有设备需求的模块，按已有镜头角度回填设备需求。
+ * 返回新的模块数组（不改原数组）。
+ */
+export function backfillModules(modules: CourseModule[]): CourseModule[] {
+  return modules.map((module) => {
+    if (Array.isArray(module.equipment)) return module;
+    return { ...module, equipment: moduleEquipmentFromCameras(module), equipmentManual: false };
+  });
+}
+
+/** 生成一份演示用教务台账（教室、档期与容量）。 */
+export function createDemoLedger(now = new Date()): TeachingLedger {
+  const classrooms: Classroom[] = [
+    { id: 'room-a', name: '录播教室 A', equipment: ['固定机位', '侧位机位', '俯拍支架', '广角机位'] },
+    { id: 'room-b', name: '普通教室 B', equipment: ['固定机位', '侧位机位'] },
+    { id: 'room-c', name: '小教室 C', equipment: ['固定机位'] },
+  ];
+  const slots: LedgerSlot[] = [
+    { id: 'slot-a-1', classroomId: 'room-a', weekday: '周一', period: '第 1–2 节', capacityHours: 2 },
+    { id: 'slot-a-2', classroomId: 'room-a', weekday: '周三', period: '第 3–4 节', capacityHours: 2 },
+    { id: 'slot-a-3', classroomId: 'room-a', weekday: '周五', period: '第 5–6 节', capacityHours: 2 },
+    { id: 'slot-b-1', classroomId: 'room-b', weekday: '周二', period: '第 1–2 节', capacityHours: 2 },
+    { id: 'slot-b-2', classroomId: 'room-b', weekday: '周四', period: '第 3–4 节', capacityHours: 2 },
+    { id: 'slot-c-1', classroomId: 'room-c', weekday: '周一', period: '第 3–4 节', capacityHours: 1 },
+  ];
+  return { importedAt: now.toISOString(), source: '教务台账演示数据', classrooms, slots };
 }
 
 export function selectedModule(project: CourseProject): CourseModule {
