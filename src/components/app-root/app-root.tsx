@@ -2,6 +2,11 @@ import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
   cloneProject,
   createDemoProject,
+  EQUIPMENT_CATALOG,
+  equipmentLabel,
+  inferModuleEquipment,
+  migrateProject,
+  moduleLessons,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
@@ -11,12 +16,30 @@ import {
   type CourseModule,
   type CourseProject,
   type Difficulty,
+  type EquipmentId,
   type GestureZone,
   type LessonStep,
   type ValidationCheck,
 } from '../../models';
+import {
+  IMPORT_MAX_ATTEMPTS,
+  IMPORT_RETRY_DELAYS,
+  applyLedgerImport,
+  createEmptySchedule,
+  fetchTeachingLedger,
+  releaseAllSuspended,
+  rescheduleAll,
+  resolveReconItem,
+  runScheduling,
+  SCHEDULE_STORAGE_KEY,
+  type LedgerFixture,
+  type ModulePlacement,
+  type ReconItem,
+  type ScheduleState,
+} from '../../scheduling/schedule';
 
 type PreviewSize = 'phone' | 'tablet';
+type StudioView = 'course' | 'schedule';
 
 @Component({
   tag: 'app-root',
@@ -27,6 +50,10 @@ export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
   @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() view: StudioView = 'course';
+  @State() schedule: ScheduleState = createEmptySchedule();
+  @State() ledgerFixture: Exclude<LedgerFixture, 'failure'> = 'baseline';
+  @State() upgradeNotice = '';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
@@ -34,18 +61,38 @@ export class AppRoot {
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
+  private retryTimer?: number;
 
   componentWillLoad(): void {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) this.project = JSON.parse(saved) as CourseProject;
+      if (saved) {
+        const raw = JSON.parse(saved) as CourseProject;
+        const isLegacy = !raw.schemaVersion || raw.schemaVersion < 2;
+        const { project, backfilledModules } = migrateProject(raw);
+        this.project = project;
+        if (isLegacy && backfilledModules.length > 0) {
+          this.upgradeNotice = `已按镜头角度为 ${backfilledModules.length} 个旧模块回填设备需求。`;
+        }
+      }
     } catch {
       this.project = createDemoProject();
     }
+    try {
+      const savedSchedule = localStorage.getItem(SCHEDULE_STORAGE_KEY);
+      if (savedSchedule) {
+        this.schedule = { ...createEmptySchedule(), ...(JSON.parse(savedSchedule) as ScheduleState) };
+      }
+    } catch {
+      this.schedule = createEmptySchedule();
+    }
+    // 进入页面即按教务台账排一次：旧安排中时长/设备已变的模块会作废重排。
+    this.schedule = runScheduling(this.schedule, this.project.modules);
   }
 
   disconnectedCallback(): void {
     if (this.playTimer) window.clearInterval(this.playTimer);
+    if (this.retryTimer) window.clearTimeout(this.retryTimer);
   }
 
   @Listen('online', { target: 'window' })
@@ -101,6 +148,37 @@ export class AppRoot {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
 
+  private persistSchedule(): void {
+    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(this.schedule));
+  }
+
+  /**
+   * 教师改动后同步排课：只有步骤总时长或设备需求发生变化、
+   * 且已有安排的模块才作废重排，其余模块保持原档期不动。
+   */
+  private syncScheduleAfterProject(before: CourseProject, after: CourseProject): string {
+    const invalidatedTitles: string[] = [];
+    before.modules.forEach((oldModule) => {
+      const nextModule = after.modules.find((item) => item.id === oldModule.id);
+      if (!nextModule) return;
+      const oldDuration = oldModule.steps.reduce((sum, step) => sum + step.duration, 0);
+      const nextDuration = nextModule.steps.reduce((sum, step) => sum + step.duration, 0);
+      const oldEquipment = (oldModule.equipment ?? []).slice().sort().join('|');
+      const nextEquipment = (nextModule.equipment ?? []).slice().sort().join('|');
+      const hadArrangement = this.schedule.placements.some(
+        (item) => item.moduleId === oldModule.id && (item.status === 'placed' || item.status === 'queued'),
+      );
+      if (hadArrangement && (oldDuration !== nextDuration || oldEquipment !== nextEquipment)) {
+        invalidatedTitles.push(nextModule.title);
+      }
+    });
+    this.schedule = runScheduling(this.schedule, after.modules);
+    this.persistSchedule();
+    return invalidatedTitles.length
+      ? `「${invalidatedTitles.join('」「')}」时长或设备已变，原排课作废并已重新安排。`
+      : '';
+  }
+
   private commit(update: (draft: CourseProject) => CourseProject, toast?: string): void {
     if (this.project.status === 'frozen') {
       this.showToast('warning', '当前版本已冻结，请先创建修订版。');
@@ -114,7 +192,15 @@ export class AppRoot {
     this.future = [];
     this.project = next;
     this.persist();
-    if (toast) this.showToast('success', toast);
+    const rescheduleNote = this.syncScheduleAfterProject(before, next);
+    if (rescheduleNote) this.showToast('warning', rescheduleNote);
+    else if (toast) this.showToast('success', toast);
+  }
+
+  private rescheduleFromProject(project: CourseProject): void {
+    // 引擎依据时长/设备签名决定保留或作废：撤销、重做后恢复到对应排课结果。
+    this.schedule = runScheduling(this.schedule, project.modules);
+    this.persistSchedule();
   }
 
   private undo(): void {
@@ -123,6 +209,7 @@ export class AppRoot {
     this.future = [cloneProject(this.project), ...this.future].slice(0, 80);
     this.project = previous;
     this.persist();
+    this.rescheduleFromProject(previous);
   }
 
   private redo(): void {
@@ -131,6 +218,7 @@ export class AppRoot {
     this.past = [...this.past, cloneProject(this.project)].slice(-80);
     this.project = next;
     this.persist();
+    this.rescheduleFromProject(next);
   }
 
   private showToast(color: string, message: string): void {
@@ -170,6 +258,116 @@ export class AppRoot {
     }));
   }
 
+  private toggleModuleEquipment(equipmentId: EquipmentId): void {
+    const current = this.currentModule;
+    if (!current) return;
+    const has = current.equipment.includes(equipmentId);
+    const equipment = has
+      ? current.equipment.filter((id) => id !== equipmentId)
+      : [...current.equipment, equipmentId];
+    this.commit(
+      (draft) => ({
+        ...draft,
+        modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? { ...module, equipment } : module),
+      }),
+      has ? '已移除模块设备需求。' : '已加入模块设备需求。',
+    );
+  }
+
+  private backfillCurrentModuleEquipment(): void {
+    const inferred = inferModuleEquipment(this.currentModule?.steps ?? []);
+    this.commit(
+      (draft) => ({
+        ...draft,
+        modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? { ...module, equipment: inferred } : module),
+      }),
+      '已按镜头角度回填设备需求。',
+    );
+  }
+
+  /* ------------------------------ 台账导入 ------------------------------ */
+
+  private async importLedger(fixture: LedgerFixture = this.ledgerFixture): Promise<void> {
+    if (this.schedule.importState.loading) return;
+    this.schedule = {
+      ...this.schedule,
+      importState: { ...this.schedule.importState, loading: true, lastError: '', attempts: 1 },
+    };
+    this.persistSchedule();
+
+    let attempt = 1;
+    // 导入失败后按教务那侧的策略重试：最多 3 次，间隔递增。
+    // 重试期间不清空已保存的上一版台账。
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        const ledger = await fetchTeachingLedger(fixture);
+        this.schedule = applyLedgerImport(this.schedule, ledger, this.project.modules);
+        this.persistSchedule();
+        const impacted = this.schedule.reconItems.filter((item) => !item.acknowledged).length;
+        this.showToast(
+          impacted ? 'warning' : 'success',
+          `已导入教务台账 ${ledger.version}。` + (impacted ? ` ${impacted} 条对账差异已挂起，请确认。` : ''),
+        );
+        return;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (attempt < IMPORT_MAX_ATTEMPTS) {
+          this.schedule = {
+            ...this.schedule,
+            importState: {
+              ...this.schedule.importState,
+              loading: true,
+              lastError: message,
+              attempts: attempt + 1,
+              lastAttemptAt: new Date().toISOString(),
+            },
+          };
+          this.persistSchedule();
+          this.showToast('warning', `教务台账导入失败，按教务策略第 ${attempt + 1} 次重试中…`);
+          await new Promise<void>((resolve) => {
+            this.retryTimer = window.setTimeout(resolve, IMPORT_RETRY_DELAYS[attempt - 1] ?? 1400);
+          });
+          attempt += 1;
+        } else {
+          this.schedule = {
+            ...this.schedule,
+            importState: {
+              loading: false,
+              lastError: message,
+              attempts: attempt,
+              lastAttemptAt: new Date().toISOString(),
+            },
+          };
+          this.persistSchedule();
+          this.showToast('danger', `教务台账连续 ${attempt} 次导入失败，保留上一版台账数据。`);
+          return;
+        }
+      }
+    }
+  }
+
+  private handleReconItem(item: ReconItem, action: 'release' | 'keep' | 'dismiss'): void {
+    this.schedule = resolveReconItem(this.schedule, item.id, action, this.project.modules);
+    this.persistSchedule();
+    this.showToast(
+      'success',
+      action === 'keep' ? '已保留挂起安排，等待教务复核。' : action === 'release' ? '挂起安排已作废，排队模块已补位重排。' : '对账条目已确认。',
+    );
+  }
+
+  private handleReleaseAllSuspended(): void {
+    this.schedule = releaseAllSuspended(this.schedule, this.project.modules);
+    this.persistSchedule();
+    this.showToast('success', '全部挂起安排已释放，并按最新台账重新排课。');
+  }
+
+  private handleRescheduleAll(): void {
+    this.schedule = rescheduleAll(this.schedule, this.project.modules);
+    this.persistSchedule();
+    this.showToast('success', '全部模块已作废并重排。');
+  }
+
   private addModule(): void {
     const index = this.project.modules.length + 1;
     const module: CourseModule = {
@@ -177,6 +375,7 @@ export class AppRoot {
       title: `模块 ${index} · 未命名`,
       summary: '说明该模块的学习目标与适用场景。',
       color: ['#15827a', '#8a3ffc', '#b34331', '#376ea8'][index % 4],
+      equipment: [],
       steps: [],
     };
     this.commit((draft) => ({ ...draft, modules: [...draft.modules, module], selectedModuleId: module.id, selectedStepId: '' }), '已创建课程模块。');
@@ -540,9 +739,237 @@ export class AppRoot {
     );
   }
 
+  private renderEquipmentEditor(module?: CourseModule) {
+    if (!module) return null;
+    const frozen = this.project.status === 'frozen';
+    const inferred = inferModuleEquipment(module.steps);
+    const inferredOnly = inferred.filter((id) => !module.equipment.includes(id));
+    return (
+      <div class="equipment-editor">
+        <div class="equipment-editor-head">
+          <label>模块设备需求</label>
+          <button class="backfill-link" disabled={frozen || inferredOnly.length === 0} title="按各步骤镜头角度推导" onClick={() => this.backfillCurrentModuleEquipment()}>
+            按镜头角度回填{inferredOnly.length > 0 ? `（缺 ${inferredOnly.length}）` : '✓'}
+          </button>
+        </div>
+        <div class="equipment-chips">
+          {EQUIPMENT_CATALOG.map((option) => {
+            const active = module.equipment.includes(option.id);
+            return (
+              <button
+                class={`equipment-chip ${active ? 'active' : ''}`}
+                disabled={frozen}
+                title={option.label}
+                onClick={() => this.toggleModuleEquipment(option.id)}
+              >
+                {active ? '✓ ' : ''}{option.short}
+              </button>
+            );
+          })}
+        </div>
+        <p class="equipment-hint">改动设备需求后，该模块已排档期会自动作废重排；不填则视为无设备要求。</p>
+      </div>
+    );
+  }
+
+  private placementBadge(placement: ModulePlacement): string {
+    switch (placement.status) {
+      case 'placed': return `已排 ${placement.classroomName ?? ''} ${placement.slotLabel ?? ''}`;
+      case 'queued': return `排队中（#${placement.queuedAt ?? '-'}）`;
+      case 'suspended': return '已挂起';
+      case 'unschedulable': return '排不下';
+      default: return '';
+    }
+  }
+
+  private moduleTitle(moduleId: string): string {
+    return this.project.modules.find((item) => item.id === moduleId)?.title ?? moduleId;
+  }
+
+  private moduleColor(moduleId: string): string {
+    return this.project.modules.find((item) => item.id === moduleId)?.color ?? '#667085';
+  }
+
+  private renderSchedule() {
+    const { ledger, placements, reconItems, importState } = this.schedule;
+    const placed = placements.filter((item) => item.status === 'placed');
+    const queued = placements
+      .filter((item) => item.status === 'queued')
+      .sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
+    const unschedulable = placements.filter((item) => item.status === 'unschedulable');
+    const suspended = placements.filter((item) => item.status === 'suspended');
+    const unresolvedRecon = reconItems.filter((item) => !item.acknowledged);
+    const usedLessons = placed.reduce((sum, item) => sum + item.lessons, 0);
+    const totalLessons = ledger?.slots.reduce((sum, slot) => sum + slot.capacity, 0) ?? 0;
+
+    return (
+      <main class="schedule-workspace">
+        <section class="schedule-board">
+          <div class="schedule-toolbar">
+            <div class="ledger-meta">
+              <span class="eyebrow">教务台账（只读）</span>
+              {ledger
+                ? <h2>版本 {ledger.version}<small>导入于 {this.formatDate(ledger.importedAt)} · {ledger.classrooms.length} 间教室 · {ledger.slots.length} 个档期</small></h2>
+                : <h2>尚未导入档期<small>档期、教室与容量以教务台账为准，工具不回写。</small></h2>}
+            </div>
+            <div class="ledger-actions">
+              <ion-select
+                label="台账版本"
+                labelPlacement="start"
+                class="ledger-fixture-select"
+                value={this.ledgerFixture}
+                onIonChange={(event) => { this.ledgerFixture = event.detail.value as Exclude<LedgerFixture, 'failure'>; }}
+              >
+                <ion-select-option value="baseline">W1 初始版（0928）</ion-select-option>
+                <ion-select-option value="v2-revised">W1 教务调整版（1004）</ion-select-option>
+              </ion-select>
+              <ion-button class="studio-button" disabled={importState.loading} onClick={() => this.importLedger()}>
+                {importState.loading ? `导入重试 ${importState.attempts}/${3}…` : ledger ? '重新导入并对账' : '从教务导入档期'}
+              </ion-button>
+              <ion-button fill="outline" color="danger" class="studio-button" disabled={importState.loading} onClick={() => this.importLedger('failure')}>模拟教务故障</ion-button>
+              <ion-button fill="outline" class="studio-button" disabled={!ledger} onClick={() => this.handleRescheduleAll()}>全部作废重排</ion-button>
+            </div>
+          </div>
+
+          {importState.lastError && (
+            <div class="ledger-error">
+              <strong>导入失败</strong>
+              <span>{importState.lastError}（已尝试 {importState.attempts} 次）</span>
+              <span class="ledger-error-sub">已保留上一版台账{ledger ? ` ${ledger.version}` : ''}，恢复后请重新导入。</span>
+              <ion-button size="small" color="danger" class="studio-button" onClick={() => this.importLedger()}>立即重试</ion-button>
+            </div>
+          )}
+
+          <div class="schedule-stat-row">
+            <div class="schedule-stat"><strong>{placed.length}</strong><span>已排模块</span></div>
+            <div class="schedule-stat"><strong>{totalLessons ? `${usedLessons}/${totalLessons}` : '—'}</strong><span>课时占用</span></div>
+            <div class={`schedule-stat ${queued.length ? 'warn' : ''}`}><strong>{queued.length}</strong><span>排队等待</span></div>
+            <div class={`schedule-stat ${unschedulable.length ? 'danger' : ''}`}><strong>{unschedulable.length}</strong><span>排不下</span></div>
+            <div class={`schedule-stat ${suspended.length || unresolvedRecon.length ? 'danger' : ''}`}><strong>{suspended.length}</strong><span>挂起</span></div>
+          </div>
+
+          {!ledger ? (
+            <div class="schedule-empty">
+              <div class="empty-glyph">档</div>
+              <h2>还没有教务档期</h2>
+              <p>点击右上角「从教务导入档期」。导入失败时会按教务侧策略自动重试，本地保留最近一次成功的台账。</p>
+            </div>
+          ) : (
+            <div class="slot-board">
+              {ledger.classrooms.map((classroom) => {
+                const slots = ledger.slots
+                  .filter((slot) => slot.classroomId === classroom.id)
+                  .sort((a, b) => a.date.localeCompare(b.date) || a.period.localeCompare(b.period));
+                return (
+                  <section class="classroom-column" key={classroom.id}>
+                    <header class="classroom-head">
+                      <strong>{classroom.name}</strong>
+                      <small>{classroom.equipment.map((id) => equipmentLabel(id)).join(' · ') || '无专用设备'}</small>
+                    </header>
+                    {slots.length === 0 && <div class="slot-card empty-slot"><span>本教室暂无档期</span></div>}
+                    {slots.map((slot) => {
+                      const placement = placements.find(
+                        (item) => item.classroomId === slot.classroomId && item.slotId === slot.id && (item.status === 'placed' || item.status === 'suspended'),
+                      );
+                      return (
+                        <div class={`slot-card ${placement?.status === 'suspended' ? 'suspended' : placement ? 'booked' : 'open'}`} key={slot.id}>
+                          <div class="slot-card-head">
+                            <strong>{slot.label}</strong>
+                            <span>{slot.capacity} 课时</span>
+                          </div>
+                          {placement ? (
+                            <button class="slot-module" style={{ borderLeftColor: this.moduleColor(placement.moduleId) }} onClick={() => { this.selectModule(placement.moduleId); this.view = 'course'; }}>
+                              <span class="slot-module-dot" style={{ background: this.moduleColor(placement.moduleId) }} />
+                              <span class="slot-module-copy">
+                                <strong>{this.moduleTitle(placement.moduleId)}</strong>
+                                <small>{placement.lessons} 课时（{placement.durationSignature} 秒）</small>
+                                {placement.status === 'suspended' && <em class="suspended-tag">挂起：{placement.suspendedReason}</em>}
+                              </span>
+                            </button>
+                          ) : (
+                            <div class="slot-open"><span>空闲 {slot.capacity} 课时</span></div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </section>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <aside class="schedule-rail">
+          <section class="rail-section recon-section">
+            <h3>台账对账 <small>按教室 + 档期逐条核对</small></h3>
+            {reconItems.length === 0 && <p class="rail-empty">最近一次导入无差异。</p>}
+            {unresolvedRecon.length === 0 && reconItems.length > 0 && <p class="rail-empty ok">差异均已确认 ✓</p>}
+            {suspended.length > 0 && (
+              <button class="rail-action danger" onClick={() => this.handleReleaseAllSuspended()}>全部挂起作废并重排（{suspended.length}）</button>
+            )}
+            {unresolvedRecon.map((item) => (
+              <div class={`recon-item ${item.status}`} key={item.id}>
+                <strong>{this.reconStatusLabel(item.status)}</strong>
+                <p>{item.classroomName}{item.slotLabel ? ` · ${item.slotLabel}` : ''}</p>
+                <small>{item.detail}</small>
+                {item.impactedModuleIds.length > 0 && (
+                  <div class="recon-impacted">影响：{item.impactedModuleIds.map((id) => this.moduleTitle(id)).join('、')}（已挂起）</div>
+                )}
+                <div class="recon-buttons">
+                  {item.impactedModuleIds.length > 0
+                    ? <button class="rail-action" onClick={() => this.handleReconItem(item, 'release')}>作废安排并重排</button>
+                    : <button class="rail-action" onClick={() => this.handleReconItem(item, 'dismiss')}>知道了</button>}
+                  {item.impactedModuleIds.length > 0 && (
+                    <button class="rail-action ghost" onClick={() => this.handleReconItem(item, 'keep')}>保留挂起</button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </section>
+
+          <section class="rail-section queue-section">
+            <h3>排队等待 <small>档期排满按 FIFO 等下一个</small></h3>
+            {queued.length === 0
+              ? <p class="rail-empty">暂无排队模块。</p>
+              : queued.map((item, index) => (
+                  <button class="queue-item" key={item.moduleId} onClick={() => { this.selectModule(item.moduleId); this.view = 'course'; }}>
+                    <span class="queue-index">{String(index + 1).padStart(2, '0')}</span>
+                    <span><strong>{this.moduleTitle(item.moduleId)}</strong><small>{item.lessons} 课时 · {item.reason}</small></span>
+                  </button>
+                ))}
+          </section>
+
+          <section class="rail-section unscheduled-section">
+            <h3>排不下 <small>设备或容量客观不满足</small></h3>
+            {unschedulable.length === 0
+              ? <p class="rail-empty ok">全部模块都可安排。</p>
+              : unschedulable.map((item) => (
+                  <button class="queue-item blocked" key={item.moduleId} onClick={() => { this.selectModule(item.moduleId); this.view = 'course'; }}>
+                    <span class="queue-index">!</span>
+                    <span><strong>{this.moduleTitle(item.moduleId)}</strong><small>{item.reason}</small></span>
+                  </button>
+                ))}
+          </section>
+        </aside>
+      </main>
+    );
+  }
+
+  private reconStatusLabel(status: ReconItem['status']): string {
+    switch (status) {
+      case 'classroom-removed': return '教室撤销';
+      case 'equipment-changed': return '设备缩减';
+      case 'slot-removed': return '档期撤销';
+      case 'slot-changed': return '档期调整';
+      case 'capacity-shrunk': return '容量缩小';
+      case 'added': return '新增资源';
+    }
+  }
+
   render() {
     const module = this.currentModule;
     const errors = this.checks.filter((check) => check.severity === 'error').length;
+    const pendingRecon = this.schedule.reconItems.filter((item) => !item.acknowledged).length;
     return (
       <Host>
         <ion-app>
@@ -579,42 +1006,59 @@ export class AppRoot {
                 <div class={errors ? 'has-errors' : ''}><strong>{errors}</strong><span>阻断问题</span></div>
               </div>
               <div class="workflow-actions">
-                {this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}
-                {this.project.status === 'draft' && <ion-button fill="clear" class="studio-button" onClick={() => this.addModule()}>＋ 新建模块</ion-button>}
-                <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>
+                <ion-segment value={this.view} class="view-segment" onIonChange={(event) => { this.view = event.detail.value as StudioView; }}>
+                  <ion-segment-button value="course">课程编排</ion-segment-button>
+                  <ion-segment-button value="schedule">档期排课{pendingRecon > 0 ? <i class="recon-dot">{pendingRecon}</i> : null}</ion-segment-button>
+                </ion-segment>
+                {this.view === 'course' && this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}
+                {this.view === 'course' && this.project.status === 'draft' && <ion-button fill="clear" class="studio-button" onClick={() => this.addModule()}>＋ 新建模块</ion-button>}
+                {this.view === 'course' && <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>}
               </div>
             </div>
 
-            <main class="studio-workspace">
-              <aside class="course-panel">
-                <div class="panel-heading"><div><span class="eyebrow">课程结构</span><h2>模块与步骤</h2></div><button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button></div>
-                <div class="module-list">
-                  {this.project.modules.map((item) => (
-                    <section class={`module-card ${item.id === module?.id ? 'active' : ''}`} key={item.id}>
-                      <button class="module-head" onClick={() => this.selectModule(item.id)}>
-                        <span class="module-color" style={{ background: item.color }} />
-                        <span><strong>{item.title}</strong><small>{item.steps.length} 个学习步骤</small></span>
-                      </button>
-                      {item.id === module?.id && <div class="step-list">{item.steps.map((lesson, index) => this.renderStepListItem(lesson, index))}</div>}
-                    </section>
-                  ))}
-                </div>
-                <div class="module-editor">
-                  <ion-input disabled={this.project.status === 'frozen'} label="当前模块标题" labelPlacement="stacked" class="studio-input" value={module?.title ?? ''} onIonInput={(event) => this.updateCurrentModule({ title: event.detail.value ?? '' })} />
-                  <ion-textarea disabled={this.project.status === 'frozen'} autoGrow label="模块目标" labelPlacement="stacked" class="studio-input" value={module?.summary ?? ''} onIonInput={(event) => this.updateCurrentModule({ summary: event.detail.value ?? '' })} />
-                </div>
-              </aside>
+            {this.upgradeNotice && (
+              <div class="upgrade-banner">
+                <strong>旧数据升级</strong><span>{this.upgradeNotice}设备需求现可在模块卡片中调整。</span>
+                <button onClick={() => { this.upgradeNotice = ''; }}>知道了</button>
+              </div>
+            )}
 
-              <section class="editor-panel">
-                <div class="panel-switcher">
-                  <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
-                  <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
-                </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
-              </section>
+            {this.view === 'schedule'
+              ? this.renderSchedule()
+              : <main class="studio-workspace">
+                  <aside class="course-panel">
+                    <div class="panel-heading"><div><span class="eyebrow">课程结构</span><h2>模块与步骤</h2></div><button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button></div>
+                    <div class="module-list">
+                      {this.project.modules.map((item) => {
+                        const placement = this.schedule.placements.find((entry) => entry.moduleId === item.id);
+                        return (
+                          <section class={`module-card ${item.id === module?.id ? 'active' : ''}`} key={item.id}>
+                            <button class="module-head" onClick={() => this.selectModule(item.id)}>
+                              <span class="module-color" style={{ background: item.color }} />
+                              <span><strong>{item.title}</strong><small>{item.steps.length} 个学习步骤 · {moduleLessons(item)} 课时{placement ? <em class={`module-placement-tag ${placement.status}`}>{this.placementBadge(placement)}</em> : ''}</small></span>
+                            </button>
+                            {item.id === module?.id && <div class="step-list">{item.steps.map((lesson, index) => this.renderStepListItem(lesson, index))}</div>}
+                          </section>
+                        );
+                      })}
+                    </div>
+                    <div class="module-editor">
+                      <ion-input disabled={this.project.status === 'frozen'} label="当前模块标题" labelPlacement="stacked" class="studio-input" value={module?.title ?? ''} onIonInput={(event) => this.updateCurrentModule({ title: event.detail.value ?? '' })} />
+                      <ion-textarea disabled={this.project.status === 'frozen'} autoGrow label="模块目标" labelPlacement="stacked" class="studio-input" value={module?.summary ?? ''} onIonInput={(event) => this.updateCurrentModule({ summary: event.detail.value ?? '' })} />
+                      {this.renderEquipmentEditor(module)}
+                    </div>
+                  </aside>
 
-              {this.renderPreview()}
-            </main>
+                  <section class="editor-panel">
+                    <div class="panel-switcher">
+                      <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
+                      <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                    </div>
+                    <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                  </section>
+
+                  {this.renderPreview()}
+                </main>}
           </ion-content>
           <ion-toast isOpen={Boolean(this.toast)} message={this.toast?.message} color={this.toast?.color} duration={3200} onDidDismiss={() => { this.toast = undefined; }} />
         </ion-app>

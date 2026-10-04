@@ -4,6 +4,57 @@ export type CameraAngle = '正面' | '左侧 45°' | '右侧 45°' | '俯拍手�
 export type CaptionPosition = '下方安全区' | '上移 15%' | '角标提示' | '画面中央';
 export type GestureZone = '左侧' | '中央' | '右侧';
 
+export const LESSON_MINUTES = 45;
+
+export type EquipmentId = 'front-camera' | 'side-camera' | 'overhead-rig' | 'wide-camera' | 'dual-camera-stand';
+
+export interface EquipmentOption {
+  id: EquipmentId;
+  label: string;
+  short: string;
+}
+
+export const EQUIPMENT_CATALOG: EquipmentOption[] = [
+  { id: 'front-camera', label: '正面固定机位', short: '正面机位' },
+  { id: 'side-camera', label: '侧面 45° 机位', short: '侧面机位' },
+  { id: 'overhead-rig', label: '俯拍手部支架', short: '俯拍支架' },
+  { id: 'wide-camera', label: '全身远景机位', short: '远景机位' },
+  { id: 'dual-camera-stand', label: '双人双机支架', short: '双机支架' },
+];
+
+export function equipmentLabel(id: EquipmentId): string {
+  return EQUIPMENT_CATALOG.find((item) => item.id === id)?.label ?? id;
+}
+
+/** 教务侧以 45 分钟为一个课时，排课容量按课时计。 */
+export const CAMERA_EQUIPMENT: Record<CameraAngle, EquipmentId[]> = {
+  '正面': ['front-camera'],
+  '左侧 45°': ['side-camera'],
+  '右侧 45°': ['side-camera'],
+  '俯拍手部': ['overhead-rig'],
+  '全身远景': ['wide-camera'],
+};
+
+/** 旧数据升级：模块没有设备需求时，按已有步骤的镜头角度回填。 */
+export function inferModuleEquipment(steps: LessonStep[]): EquipmentId[] {
+  const ids: EquipmentId[] = [];
+  steps.forEach((step) => {
+    CAMERA_EQUIPMENT[step.camera].forEach((id) => {
+      if (!ids.includes(id)) ids.push(id);
+    });
+  });
+  return ids;
+}
+
+export function moduleDurationMinutes(module: CourseModule): number {
+  return module.steps.reduce((total, step) => total + step.duration, 0);
+}
+
+/** 模块总时长折算课时，不足一个课时按一个课时排。 */
+export function moduleLessons(module: CourseModule): number {
+  return Math.max(1, Math.ceil(moduleDurationMinutes(module) / LESSON_MINUTES));
+}
+
 export interface LessonStep {
   id: string;
   title: string;
@@ -30,6 +81,7 @@ export interface CourseModule {
   title: string;
   summary: string;
   color: string;
+  equipment: EquipmentId[];
   steps: LessonStep[];
 }
 
@@ -42,6 +94,7 @@ export interface FrozenVersion {
 
 export interface CourseProject {
   id: string;
+  schemaVersion: number;
   title: string;
   teacher: string;
   audience: string;
@@ -52,6 +105,26 @@ export interface CourseProject {
   frozenVersions: FrozenVersion[];
   lastSavedAt: string;
   revision: number;
+}
+
+/**
+ * 升级旧版本本地数据：v1 没有模块设备需求，
+ * 按模块已有步骤的镜头角度回填。
+ */
+export function migrateProject(raw: unknown): { project: CourseProject; backfilledModules: CourseModule[] } {
+  const project = raw as CourseProject;
+  const backfilledModules: CourseModule[] = [];
+  project.modules = (project.modules ?? []).map((module) => {
+    const known = Array.isArray(module.equipment)
+      ? module.equipment.filter((id) => EQUIPMENT_CATALOG.some((option) => option.id === id))
+      : [];
+    if (known.length > 0) return { ...module, equipment: known };
+    const equipment = inferModuleEquipment(module.steps ?? []);
+    backfilledModules.push(module);
+    return { ...module, equipment };
+  });
+  project.schemaVersion = 2;
+  return { project, backfilledModules };
 }
 
 export interface ValidationCheck {
@@ -72,6 +145,7 @@ export function createDemoProject(): CourseProject {
       title: '模块一 · 日常问候',
       summary: '建立手形、视线和面部表情之间的配合，完成三个基础问候。',
       color: '#15827a',
+      equipment: ['front-camera', 'overhead-rig', 'wide-camera'],
       steps: [
         {
           id: 'step-1-1',
@@ -140,6 +214,7 @@ export function createDemoProject(): CourseProject {
       title: '模块二 · 数量表达',
       summary: '用数字、空间位置和顺序词完成价格询问。',
       color: '#8a3ffc',
+      equipment: ['front-camera', 'side-camera'],
       steps: [
         {
           id: 'step-2-1',
@@ -187,6 +262,7 @@ export function createDemoProject(): CourseProject {
 
   return {
     id: 'sign-course-project',
+    schemaVersion: 2,
     title: '零基础手语 · 问候与数量',
     teacher: '陈老师 / 特殊教育中心',
     audience: '初次接触手语的初中学习者',
